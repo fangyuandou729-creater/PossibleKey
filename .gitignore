@@ -1,0 +1,17 @@
+.venv/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+/mappings.json
+
+# Keep packaged release artifacts.
+!dist/
+!dist/PossibleKey.exe
+!dist/mappings.json
+
+# Old temporary build output.
+dist/PossibleKey_repeat.exe
+PossibleKey_repeat.spec
