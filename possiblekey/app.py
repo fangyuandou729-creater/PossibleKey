@@ -8,7 +8,7 @@ import tkinter as tk
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 try:
@@ -24,6 +24,8 @@ except ImportError:  # pragma: no cover - shown in the GUI at runtime.
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 CONFIG_PATH = APP_DIR / "mappings.json"
+MACROS_PATH = APP_DIR / "macros.json"
+F8_HOTKEY = "f8"
 
 MODIFIER_ORDER = {
     "ctrl": 0,
@@ -101,6 +103,16 @@ class KeyMapping:
     source: str
     target: str
     enabled: bool = True
+
+
+@dataclass
+class MacroScript:
+    id: str
+    name: str
+    events: list[dict[str, Any]]
+    run_count: int = 0
+    abnormal_count: int = 0
+    created_at: str = ""
 
 
 class ToggleSwitch(tk.Canvas):
@@ -245,14 +257,18 @@ class PossibleKeyApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PossibleKey")
-        self.geometry("920x640")
-        self.minsize(800, 540)
+        self.geometry("980x780")
+        self.minsize(860, 640)
 
         self.mappings: list[KeyMapping] = []
+        self.macros: list[MacroScript] = []
         self.active_keyboard_hooks: dict[str, object] = {}
         self.active_mouse_hooks: dict[str, object] = {}
         self.capture_keyboard_hook: object | None = None
         self.capture_mouse_hook: object | None = None
+        self.macro_keyboard_hook: object | None = None
+        self.macro_mouse_hook: object | None = None
+        self.macro_hotkey: object | None = None
         self.capture_kind: str | None = None
         self.hooks_suspended_for_capture = False
         self.target_capture_tokens: list[str] = []
@@ -260,7 +276,15 @@ class PossibleKeyApp(tk.Tk):
         self.pressed_sources: set[str] = set()
         self.capture_lock = threading.Lock()
         self.firing_lock = threading.Lock()
+        self.macro_lock = threading.Lock()
+        self.macro_stop_event = threading.Event()
+        self.macro_thread: threading.Thread | None = None
         self.is_firing = False
+        self.is_recording_macro = False
+        self.is_running_macro = False
+        self.recorded_macro_events: list[dict[str, Any]] = []
+        self.macro_pressed_keys: set[str] = set()
+        self.macro_last_event_time = 0.0
 
         self.source_key = tk.StringVar(value="")
         self.target_combo = tk.StringVar(value="")
@@ -273,8 +297,11 @@ class PossibleKeyApp(tk.Tk):
         self._setup_style()
         self._build_ui()
         self._load_mappings()
+        self._load_macros()
         self._render_mappings()
+        self._render_macros()
         self._refresh_hooks()
+        self._register_macro_hotkey()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         missing = []
@@ -368,7 +395,21 @@ class PossibleKeyApp(tk.Tk):
         ttk.Label(list_header, text="映射列表", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
 
         self.list_frame = ttk.Frame(outer)
-        self.list_frame.pack(fill="both", expand=True)
+        self.list_frame.pack(fill="x")
+
+        macro_header = ttk.Frame(outer)
+        macro_header.pack(fill="x", pady=(16, 8))
+        ttk.Label(macro_header, text="宏脚本", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+        ttk.Label(macro_header, text="F8 开始/停止录制或停止运行", style="Subtle.TLabel").pack(side="left", padx=(12, 0))
+        self.record_macro_button = ttk.Button(macro_header, text="开始录制", command=self._start_macro_recording)
+        self.record_macro_button.pack(side="right")
+        self.stop_macro_button = ttk.Button(macro_header, text="停止并保存", command=self._stop_macro_recording, state="disabled")
+        self.stop_macro_button.pack(side="right", padx=(0, 8))
+        self.stop_run_button = ttk.Button(macro_header, text="停止运行", command=self._stop_macro_run, state="disabled")
+        self.stop_run_button.pack(side="right", padx=(0, 8))
+
+        self.macro_list_frame = ttk.Frame(outer)
+        self.macro_list_frame.pack(fill="both", expand=True)
 
     def _load_mappings(self) -> None:
         if not CONFIG_PATH.exists():
@@ -389,9 +430,36 @@ class PossibleKeyApp(tk.Tk):
             messagebox.showwarning("配置读取失败", "mappings.json 无法读取，已使用空配置启动。")
             self.mappings = []
 
+    def _load_macros(self) -> None:
+        if not MACROS_PATH.exists():
+            return
+        try:
+            payload = json.loads(MACROS_PATH.read_text(encoding="utf-8"))
+            self.macros = [
+                MacroScript(
+                    id=str(item.get("id") or uuid4()),
+                    name=str(item.get("name") or "未命名宏"),
+                    events=list(item.get("events") or []),
+                    run_count=int(item.get("run_count", 0)),
+                    abnormal_count=int(item.get("abnormal_count", 0)),
+                    created_at=str(item.get("created_at") or ""),
+                )
+                for item in payload
+                if isinstance(item.get("events"), list)
+            ]
+        except (OSError, json.JSONDecodeError, ValueError):
+            messagebox.showwarning("宏脚本读取失败", "macros.json 无法读取，已使用空宏列表启动。")
+            self.macros = []
+
     def _save_mappings(self) -> None:
         CONFIG_PATH.write_text(
             json.dumps([asdict(mapping) for mapping in self.mappings], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _save_macros(self) -> None:
+        MACROS_PATH.write_text(
+            json.dumps([asdict(macro) for macro in self.macros], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -628,6 +696,28 @@ class PossibleKeyApp(tk.Tk):
 
             ttk.Button(row, text="删除", style="Danger.TButton", command=lambda item=mapping: self._delete_mapping(item)).grid(row=0, column=3, padx=(12, 0))
 
+    def _render_macros(self) -> None:
+        for child in self.macro_list_frame.winfo_children():
+            child.destroy()
+
+        if not self.macros:
+            empty = ttk.Frame(self.macro_list_frame, style="Panel.TFrame", padding=22)
+            empty.pack(fill="x")
+            ttk.Label(empty, text="还没有宏脚本。点击“开始录制”，操作完成后点击“停止并保存”。", style="Panel.TLabel").pack()
+            return
+
+        for macro in self.macros:
+            row = ttk.Frame(self.macro_list_frame, style="Panel.TFrame", padding=(14, 12))
+            row.pack(fill="x", pady=(0, 10))
+            row.columnconfigure(0, weight=1)
+
+            title = f"{macro.name}  ·  {len(macro.events)} 步"
+            stats = f"运行 {macro.run_count} 次 / 异常终止 {macro.abnormal_count} 次"
+            ttk.Label(row, text=title, style="Panel.TLabel", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+            ttk.Label(row, text=stats, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
+            ttk.Button(row, text="运行", command=lambda item=macro: self._run_macro(item)).grid(row=0, column=1, rowspan=2, padx=(12, 0))
+            ttk.Button(row, text="删除", style="Danger.TButton", command=lambda item=macro: self._delete_macro(item)).grid(row=0, column=2, rowspan=2, padx=(8, 0))
+
     def _set_mapping_enabled(self, mapping: KeyMapping, enabled: bool) -> None:
         mapping.enabled = enabled
         self._save_mappings()
@@ -642,6 +732,277 @@ class PossibleKeyApp(tk.Tk):
         self._render_mappings()
         self._refresh_hooks()
         self.status_text.set("映射已删除")
+
+    def _start_macro_recording(self) -> None:
+        if not self._input_ready():
+            return
+        if self.capture_kind is not None:
+            self.status_text.set("请先完成当前按键捕获")
+            return
+        if self.is_running_macro:
+            self.status_text.set("宏正在运行，停止后才能录制")
+            return
+        if self.is_recording_macro:
+            return
+
+        self._clear_active_hooks()
+        with self.macro_lock:
+            self.recorded_macro_events = []
+            self.macro_pressed_keys = set()
+            self.macro_last_event_time = time.time()
+            self.is_recording_macro = True
+
+        self.record_macro_button.state(["disabled"])
+        self.stop_macro_button.state(["!disabled"])
+        self.status_text.set("宏录制中，F8 或“停止并保存”结束")
+        self.macro_keyboard_hook = keyboard.hook(self._handle_macro_keyboard_event, suppress=False)
+        self.macro_mouse_hook = mouse.hook(self._handle_macro_mouse_event)
+
+    def _stop_macro_recording(self) -> None:
+        if not self.is_recording_macro:
+            return
+        self._clear_macro_recording_hooks()
+        with self.macro_lock:
+            events = list(self.recorded_macro_events)
+            self.recorded_macro_events = []
+            self.macro_pressed_keys = set()
+            self.is_recording_macro = False
+
+        self.record_macro_button.state(["!disabled"])
+        self.stop_macro_button.state(["disabled"])
+        self._refresh_hooks()
+        if not events:
+            self.status_text.set("没有录到有效动作，未保存宏脚本")
+            return
+
+        created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        macro = MacroScript(
+            id=str(uuid4()),
+            name=f"宏脚本 {time.strftime('%Y%m%d-%H%M%S')}",
+            events=events,
+            created_at=created_at,
+        )
+        self.macros.append(macro)
+        self._save_macros()
+        self._render_macros()
+        self.status_text.set(f"已保存 {macro.name}，共 {len(events)} 步")
+
+    def _clear_macro_recording_hooks(self) -> None:
+        if self.macro_keyboard_hook is not None and keyboard is not None:
+            try:
+                keyboard.unhook(self.macro_keyboard_hook)
+            except (KeyError, ValueError):
+                pass
+        if self.macro_mouse_hook is not None and mouse is not None:
+            try:
+                mouse.unhook(self.macro_mouse_hook)
+            except ValueError:
+                pass
+        self.macro_keyboard_hook = None
+        self.macro_mouse_hook = None
+
+    def _handle_macro_keyboard_event(self, event: object) -> None:
+        token = normalize_input_token(getattr(event, "name", ""))
+        if not token or token == F8_HOTKEY:
+            return
+        event_type = getattr(event, "event_type", "")
+        with self.macro_lock:
+            if not self.is_recording_macro:
+                return
+            if event_type == "up":
+                self.macro_pressed_keys.discard(token)
+                return
+            if event_type != "down" or token in self.macro_pressed_keys:
+                return
+            self.macro_pressed_keys.add(token)
+            self._append_macro_event_locked({"type": "key_press", "key": token, "count": 1})
+
+    def _handle_macro_mouse_event(self, event: object) -> None:
+        if self._is_pointer_over_widget(self):
+            return
+        token = self._mouse_event_to_token(event)
+        if not token:
+            return
+        with self.macro_lock:
+            if not self.is_recording_macro:
+                return
+            if is_mouse_button_token(token):
+                x, y = mouse.get_position()
+                self._append_macro_event_locked(
+                    {
+                        "type": "mouse_click",
+                        "button": token.split(":", 1)[1],
+                        "x": int(x),
+                        "y": int(y),
+                        "count": 1,
+                    }
+                )
+            elif is_wheel_token(token):
+                self._append_macro_event_locked(
+                    {
+                        "type": "wheel",
+                        "direction": token.split(":", 1)[1],
+                        "count": 1,
+                    }
+                )
+
+    def _append_macro_event_locked(self, event: dict[str, Any]) -> None:
+        now = time.time()
+        delay = max(0.0, now - self.macro_last_event_time)
+        self.macro_last_event_time = now
+
+        if self.recorded_macro_events and self._can_merge_macro_event(self.recorded_macro_events[-1], event, delay):
+            self.recorded_macro_events[-1]["count"] = int(self.recorded_macro_events[-1].get("count", 1)) + 1
+            return
+
+        event["delay"] = round(delay, 3) if self.recorded_macro_events else 0.0
+        self.recorded_macro_events.append(event)
+        self.after(0, lambda: self.status_text.set(f"宏录制中，已记录 {len(self.recorded_macro_events)} 步"))
+
+    def _can_merge_macro_event(self, previous: dict[str, Any], event: dict[str, Any], delay: float) -> bool:
+        if delay > 0.5 or previous.get("type") != event.get("type"):
+            return False
+        if event.get("type") == "key_press":
+            return previous.get("key") == event.get("key")
+        if event.get("type") == "mouse_click":
+            return (
+                previous.get("button") == event.get("button")
+                and abs(int(previous.get("x", 0)) - int(event.get("x", 0))) <= 2
+                and abs(int(previous.get("y", 0)) - int(event.get("y", 0))) <= 2
+            )
+        if event.get("type") == "wheel":
+            return previous.get("direction") == event.get("direction")
+        return False
+
+    def _run_macro(self, macro: MacroScript) -> None:
+        if self.is_recording_macro:
+            self.status_text.set("正在录制，停止后才能运行宏")
+            return
+        if self.is_running_macro:
+            self.status_text.set("已有宏正在运行")
+            return
+        if not macro.events:
+            self.status_text.set("这个宏没有可运行的动作")
+            return
+
+        self.macro_stop_event.clear()
+        self.is_running_macro = True
+        self.record_macro_button.state(["disabled"])
+        self.stop_run_button.state(["!disabled"])
+        self.status_text.set(f"正在运行 {macro.name}，F8 可停止")
+        self.macro_thread = threading.Thread(target=self._run_macro_worker, args=(macro,), daemon=True)
+        self.macro_thread.start()
+
+    def _run_macro_worker(self, macro: MacroScript) -> None:
+        abnormal = False
+        try:
+            for event in macro.events:
+                if not self._sleep_macro_delay(float(event.get("delay", 0.0))):
+                    abnormal = True
+                    break
+                if not self._execute_macro_event(event):
+                    abnormal = True
+                    break
+        except Exception:
+            abnormal = True
+
+        if abnormal:
+            macro.abnormal_count += 1
+            message = f"{macro.name} 已异常终止"
+        else:
+            macro.run_count += 1
+            message = f"{macro.name} 运行完成"
+
+        self._save_macros()
+        self.after(0, lambda: self._finish_macro_run(message))
+
+    def _sleep_macro_delay(self, delay: float) -> bool:
+        deadline = time.time() + max(0.0, delay)
+        while time.time() < deadline:
+            if self.macro_stop_event.is_set():
+                return False
+            time.sleep(min(0.05, deadline - time.time()))
+        return not self.macro_stop_event.is_set()
+
+    def _execute_macro_event(self, event: dict[str, Any]) -> bool:
+        if self.macro_stop_event.is_set():
+            return False
+        count = max(1, int(event.get("count", 1)))
+        event_type = event.get("type")
+
+        if event_type == "key_press":
+            key = normalize_input_token(str(event.get("key", "")))
+            if not key:
+                return True
+            for _ in range(count):
+                if self.macro_stop_event.is_set():
+                    return False
+                keyboard.press_and_release(key)
+                time.sleep(0.03)
+            return True
+
+        if event_type == "mouse_click":
+            x = int(event.get("x", 0))
+            y = int(event.get("y", 0))
+            button = str(event.get("button", "left"))
+            mouse.move(x, y, absolute=True, duration=0)
+            for _ in range(count):
+                if self.macro_stop_event.is_set():
+                    return False
+                mouse.click(button)
+                time.sleep(0.04)
+            return True
+
+        if event_type == "wheel":
+            direction = str(event.get("direction", "up"))
+            for _ in range(count):
+                if self.macro_stop_event.is_set():
+                    return False
+                mouse.wheel(1 if direction == "up" else -1)
+                time.sleep(0.03)
+            return True
+
+        return True
+
+    def _finish_macro_run(self, message: str) -> None:
+        self.is_running_macro = False
+        self.record_macro_button.state(["!disabled"])
+        self.stop_run_button.state(["disabled"])
+        self._render_macros()
+        self.status_text.set(message)
+
+    def _stop_macro_run(self) -> None:
+        if self.is_running_macro:
+            self.macro_stop_event.set()
+            self.status_text.set("正在停止宏运行...")
+
+    def _delete_macro(self, macro: MacroScript) -> None:
+        if self.is_running_macro:
+            self.status_text.set("宏运行中，停止后再删除")
+            return
+        self.macros = [item for item in self.macros if item.id != macro.id]
+        self._save_macros()
+        self._render_macros()
+        self.status_text.set("宏脚本已删除")
+
+    def _register_macro_hotkey(self) -> None:
+        if keyboard is None:
+            return
+        try:
+            self.macro_hotkey = keyboard.add_hotkey(F8_HOTKEY, lambda: self.after(0, self._toggle_macro_by_hotkey), suppress=False)
+        except (ValueError, OSError) as exc:
+            self.status_text.set(f"F8 热键注册失败：{exc}")
+
+    def _toggle_macro_by_hotkey(self) -> None:
+        if self.capture_kind is not None:
+            return
+        if self.is_recording_macro:
+            self._stop_macro_recording()
+            return
+        if self.is_running_macro:
+            self._stop_macro_run()
+            return
+        self._start_macro_recording()
 
     def _on_global_toggle(self) -> None:
         self.global_state_text.set("开启" if self.global_enabled.get() else "关闭")
@@ -704,7 +1065,7 @@ class PossibleKeyApp(tk.Tk):
             return False
 
     def _handle_keyboard_mapping_event(self, mapping: KeyMapping, event: object) -> bool:
-        if self.capture_kind is not None:
+        if self.capture_kind is not None or self.is_running_macro:
             return True
         source = normalize_input_token(mapping.source)
         event_type = getattr(event, "event_type", "")
@@ -720,7 +1081,7 @@ class PossibleKeyApp(tk.Tk):
         return False
 
     def _handle_mouse_mapping_event(self, mapping: KeyMapping, event: object) -> None:
-        if self.capture_kind is not None:
+        if self.capture_kind is not None or self.is_running_macro:
             return
         if self._is_replaying():
             return
@@ -795,6 +1156,17 @@ class PossibleKeyApp(tk.Tk):
 
     def _on_close(self) -> None:
         self._stop_capture(restore_hooks=False)
+        if self.is_recording_macro:
+            self._clear_macro_recording_hooks()
+            self.is_recording_macro = False
+        if self.is_running_macro:
+            self.macro_stop_event.set()
+        if self.macro_hotkey is not None and keyboard is not None:
+            try:
+                keyboard.remove_hotkey(self.macro_hotkey)
+            except (KeyError, ValueError):
+                pass
+            self.macro_hotkey = None
         self._clear_active_hooks()
         self.destroy()
 
